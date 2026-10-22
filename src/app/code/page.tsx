@@ -512,6 +512,16 @@ export default function CodeSourcePage() {
     try {
       const response = await fetch(`/api/code-source/scheduler?sourceId=${encodeURIComponent(id)}`, { method: "POST" })
       const payload = await response.json() as { job?: IndexJob; error?: string }
+      // 409 = 该 source 已有任务在跑/排队，service 会连 job 一起返回。把它当成
+      // 「已经在同步」而不是失败——之前这里只看 response.ok，一律抛
+      // "启动同步失败"，用户看到的是错误但任务其实没任何问题。
+      if (response.status === 409 && payload.job) {
+        window.sessionStorage.setItem(ACTIVE_JOB_STORAGE_KEY, payload.job.id)
+        setJob(payload.job)
+        setJobs((current) => [payload.job!, ...current.filter((item) => item.id !== payload.job!.id)])
+        setSuccess(`Source ${id} 已有同步任务在进行中，已跟随该任务`)
+        return
+      }
       if (!response.ok || !payload.job) throw new Error(payload.error || "启动同步失败")
       window.sessionStorage.setItem(ACTIVE_JOB_STORAGE_KEY, payload.job.id)
       setJob(payload.job)

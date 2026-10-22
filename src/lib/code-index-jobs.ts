@@ -16,7 +16,7 @@ export function listCodeIndexJobs(): Promise<CodeIndexJob[]> {
   return listSyncJobs()
 }
 
-export function startCodeIndexJob(options: { root: string; sourceId?: string; workers?: number; syncPull?: boolean }): Promise<{ job: CodeIndexJob; duplicate: boolean }> {
+export function startCodeIndexJob(options: { root: string; sourceId?: string; workers?: number; syncPull?: boolean; forceImport?: boolean }): Promise<{ job: CodeIndexJob; duplicate: boolean }> {
   if (!options.sourceId) {
     return Promise.resolve({
       job: {
@@ -31,7 +31,13 @@ export function startCodeIndexJob(options: { root: string; sourceId?: string; wo
       duplicate: false,
     })
   }
-  return startSyncJob({ root: options.root, sourceId: options.sourceId, workers: options.workers, syncPull: options.syncPull })
+  return startSyncJob({
+    root: options.root,
+    sourceId: options.sourceId,
+    workers: options.workers,
+    syncPull: options.syncPull,
+    ...(options.forceImport === true ? { forceImport: true } : {}),
+  })
 }
 
 // Retained as a type-level compatibility export for callers that previously

@@ -2,6 +2,8 @@ import { spawn, type ChildProcess } from "node:child_process"
 import { execFile as execFileCb } from "node:child_process"
 import { randomUUID } from "node:crypto"
 import { promisify } from "node:util"
+import { readdir } from "node:fs/promises"
+import { join } from "node:path"
 import { acquireStateLock, readJson, releaseStateLock, writeJsonAtomic } from "@/lib/web-state"
 import { isGitRepository } from "@/lib/code-source"
 import { callGBrainServer } from "@/lib/gbrain-server"
@@ -32,6 +34,43 @@ async function detectCodeFiles(root: string): Promise<boolean> {
     // git 不可用/非仓库 → 不施加 auto 策略
     return false
   }
+}
+
+/**
+ * Same question as `detectCodeFiles`, answered by walking the filesystem.
+ *
+ * `detectCodeFiles` reads `git ls-files`, which for a repo/west manifest
+ * workspace describes only the root project (see `forceImport` in
+ * startSyncJob). An imported manifest needs the CODE-edges pass, and that
+ * pass is gated on this answer — so it must look at the whole tree, not the
+ * root's git index. Stops at the first hit; `.repo` and the usual build/dep
+ * directories are skipped so a manifest with prebuilt tooling does not answer
+ * "yes" on their behalf.
+ */
+async function detectCodeFilesOnDisk(root: string): Promise<boolean> {
+  const skip = new Set([".repo", ".git", "node_modules", "build", "dist", "out", "target", "coverage", "__pycache__", ".venv", "venv"])
+  const pending: string[] = [root]
+  let budget = 50_000
+  while (pending.length > 0 && budget > 0) {
+    const dir = pending.pop()!
+    let entries
+    try {
+      entries = await readdir(dir, { withFileTypes: true })
+    } catch {
+      continue
+    }
+    for (const entry of entries) {
+      budget -= 1
+      if (budget <= 0) return false
+      if (entry.isSymbolicLink()) continue
+      if (entry.isDirectory()) {
+        if (!skip.has(entry.name)) pending.push(join(dir, entry.name))
+        continue
+      }
+      if (entry.isFile() && CODE_FILE_RE.test(entry.name)) return true
+    }
+  }
+  return false
 }
 
 export type SyncJobStatus = "queued" | "running" | "completed" | "failed"
@@ -138,11 +177,28 @@ async function repairOrphanJobs(): Promise<SyncJob[]> {
   const manifestLive = (globalThis as typeof globalThis & { __gbrainManifestActiveJobIds?: Set<string> }).__gbrainManifestActiveJobIds
   let changed = false
   for (const item of local) {
+    if (item.status !== "running" && item.status !== "queued") continue
     if (item.queue === "minion" || item.minionId != null) {
-      // 已提交给 minions 队列的任务由队列侧驱动，不归 web 本地管。
+      // 队列侧驱动 ≠ 队列侧会回写本地快照。提交时这里写一条 `queued`，而之后
+      // 只有 getSyncJob 会去 gbrain 取实时状态，**取到也不回写** —— 于是任务
+      // 早已 completed，本地仍是 queued，startSyncJob 的查重永远命中它，
+      // 「立即同步」从此对该 source 永久返回 409。实测 dsp-xirui 被一条 8 小时
+      // 前的 minion-3 锁死，20 次同步全部失败。
+      // 以数据库为准：终态就落到本地；查不到（被 prune / 从未落库）也按失败收掉。
+      const real = await fetchMinionStatus(item)
+      if (real) {
+        item.status = real.status
+        if (real.finishedAt) item.finishedAt = real.finishedAt
+        if (real.message) item.message = real.message
+        changed = true
+      } else {
+        item.status = "failed"
+        item.finishedAt = item.finishedAt ?? new Date().toISOString()
+        item.message = item.message ? `${item.message} · 队列中已无此任务` : "队列中已无此任务"
+        changed = true
+      }
       continue
     }
-    if (item.status !== "running" && item.status !== "queued") continue
     if (item.id && active.has(item.id)) continue // 有活子进程 = 真任务
     if (item.id && manifestLive?.has(item.id)) continue // 活着的 manifest 父任务
     item.status = "failed"
@@ -152,6 +208,27 @@ async function repairOrphanJobs(): Promise<SyncJob[]> {
   }
   if (changed) await saveJobs(local)
   return local
+}
+
+/**
+ * 向 gbrain 要一条 minion 任务的实时状态。
+ *
+ * 返回 null 有两种含义，对调用方是同一件事——这条本地记录不该再挡住新提交：
+ * 队列里已经没有它（被 prune），或者查询本身失败（服务不可用）。后者宁可
+ * 放行也不要永久锁死一个 source；真的还在跑时，`listMinionSyncJobs()` 那条
+ * 以数据库为准的查重会把这次提交挡回去。
+ */
+async function fetchMinionStatus(item: SyncJob): Promise<{ status: SyncJobStatus; finishedAt?: string; message?: string } | null> {
+  if (item.minionId == null || !Number.isFinite(item.minionId)) return null
+  try {
+    const row = (await callGBrainServer("get_job", { id: item.minionId })) as Record<string, unknown> | null
+    if (!row || typeof row !== "object" || !("id" in row)) return null
+    const mapped = minionJobToSyncJob(row)
+    if (!mapped) return null
+    return { status: mapped.status, finishedAt: mapped.finishedAt, message: mapped.message }
+  } catch {
+    return null
+  }
 }
 
 export async function listSyncJobs(): Promise<SyncJob[]> {
@@ -422,7 +499,10 @@ async function findActiveEmbedJobId(sourceId: string): Promise<number | null> {
           jobs?: Array<{ id?: number | string; data?: { sourceId?: unknown } }>
         } | Array<{ id?: number | string; data?: { sourceId?: unknown } }> | null
         const rows = Array.isArray(raw) ? raw : Array.isArray(raw?.jobs) ? raw.jobs : []
-        const hit = rows.find((row) => row && row.data?.sourceId === sourceId)
+        // A whole-brain embed (sourceId null) scans every stale chunk, so it
+        // covers this source's backfill too — matching only the exact id would
+        // queue a redundant scoped job beside it.
+        const hit = rows.find((row) => row && (row.data?.sourceId == null || row.data?.sourceId === sourceId))
         if (hit && typeof hit.id !== "undefined" && Number.isFinite(Number(hit.id))) return Number(hit.id)
       } catch {
         // 单个查询失败继续尝试其余状态/名称。
@@ -492,7 +572,32 @@ export async function getSourceEmbedStatus(
   }
 }
 
-export async function startSyncJob(options: { root: string; sourceId: string; workers?: number; syncPull?: boolean; fullSync?: boolean; staleMs?: number }): Promise<{ job: SyncJob; duplicate: boolean }> {
+export async function startSyncJob(options: {
+  root: string
+  sourceId: string
+  workers?: number
+  syncPull?: boolean
+  fullSync?: boolean
+  staleMs?: number
+  /**
+   * Index by walking the directory instead of syncing the git checkout.
+   *
+   * Set for repo/west manifest workspaces. Their root IS a git repository
+   * (repo checks out the manifest's `<project path=".">` there), so the
+   * `isGitRepository` probe below routes them to `sync` — but `git ls-files`
+   * at that root only sees that ONE project. Measured on the sdk manifest:
+   * 33 661 tracked files at the root while `component/application/azure`,
+   * `component/tflite_micro` and `tools/ats` contributed 0 each, because
+   * `repo` checks every other project out as its own git repo whose `.git`
+   * is a file pointing into `.repo/projects/`. A `sync` there would index
+   * the `loong` tree and silently drop every subproject.
+   *
+   * `import` walks the filesystem, so it sees all of them — and its handler
+   * already auto-registers a missing source (minions/handlers/import.ts),
+   * which is the other half of what manifest sync needs.
+   */
+  forceImport?: boolean
+}): Promise<{ job: SyncJob; duplicate: boolean }> {
   const existingMinion = (await listMinionSyncJobs()).find((job) => job.sourceId === options.sourceId && (job.status === "queued" || job.status === "running"))
   if (existingMinion) return { job: existingMinion, duplicate: true }
 
@@ -505,15 +610,23 @@ export async function startSyncJob(options: { root: string; sourceId: string; wo
   // 误报 duplicate 而永远无法真正启动 SDK 索引。
   const existing = repaired.find((job) => job.sourceId === options.sourceId && (job.status === "queued" || job.status === "running") && job.mode !== "manifest")
   if (existing) {
-    // 遗留 stale 检查仅兜底极短窗口的竞态（自愈刚跑完、子进程刚好退出）。
-    const staleMs = options.staleMs ?? 10 * 60 * 1000
-    const ageMs = Date.now() - new Date(existing.startedAt).getTime()
-    const stale = ageMs > staleMs
-    if (!stale) return { job: existing, duplicate: true }
-    await updateJob({ ...existing, status: "failed", finishedAt: new Date().toISOString(), message: `${existing.message ?? "已中断任务"}[自动修复:陈旧任务超时，标记为 failed 以释放锁]`, exitCode: existing.exitCode ?? 1 })
+    // 本地仍然是 running/queued，但 repairOrphanJobs 已经用数据库状态修过一遍；
+    // 走到这里说明它确实还活着——除非这一步和修复之间刚好结束。再取一次实时
+    // 状态确认，避免一条刚完成的任务被当成"重复"拒绝掉。
+    const real = await fetchMinionStatus(existing)
+    if (real && real.status !== "running" && real.status !== "queued") {
+      await updateJob({ ...existing, status: real.status, finishedAt: real.finishedAt ?? new Date().toISOString(), message: real.message ?? existing.message })
+    } else {
+      // 遗留 stale 检查仅兜底极短窗口的竞态（自愈刚跑完、子进程刚好退出）。
+      const staleMs = options.staleMs ?? 10 * 60 * 1000
+      const ageMs = Date.now() - new Date(existing.startedAt).getTime()
+      const stale = ageMs > staleMs
+      if (!stale) return { job: existing, duplicate: true }
+      await updateJob({ ...existing, status: "failed", finishedAt: new Date().toISOString(), message: `${existing.message ?? "已中断任务"}[自动修复:陈旧任务超时，标记为 failed 以释放锁]`, exitCode: existing.exitCode ?? 1 })
+    }
   }
 
-  const mode = await isGitRepository(options.root) ? "sync" : "import"
+  const mode = options.forceImport ? "import" : await isGitRepository(options.root) ? "sync" : "import"
   const job: SyncJob = {
     id: randomUUID(),
     sourceId: options.sourceId,
@@ -526,7 +639,7 @@ export async function startSyncJob(options: { root: string; sourceId: string; wo
   await updateJob(job)
 
   // 源码检测与 full 策略在 minions 分支与回退分支都用到,提前到函数作用域计算一次。
-  const hasCode = mode === "sync" ? await detectCodeFiles(options.root) : false
+  const hasCode = mode === "sync" ? await detectCodeFiles(options.root) : options.forceImport ? await detectCodeFilesOnDisk(options.root) : false
   const fullSync = options.fullSync ?? hasCode
 
   // 方案D阶段1:优先将任务提交到 gbrain 的 minions 持久化队列(由独立 supervisor

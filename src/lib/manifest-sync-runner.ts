@@ -40,7 +40,22 @@ async function bindGBrainSource(sourceId: string, root: string): Promise<void> {
   // 不受 0.60 远端写围栏/参数限制）。详见 lib/gbrain-cli.ts 头注释。
   const listed = await callGBrainServer("sources_list", { include_archived: true }) as { sources?: Array<{ id?: string; local_path?: string | null; archived?: boolean }> }
   const existing = listed.sources?.find((source) => source.id === sourceId)
-  if (!existing) return
+  if (!existing) {
+    // A manifest source is almost always a NEW source — that is the point of
+    // the fan-in import: one manifest URL, one fresh SDK in the brain. The old
+    // `if (!existing) return` made that case a silent no-op, so the index job
+    // below ran against an unregistered source and finished "completed" with
+    // zero pages (measured: sdk-aurora, `repo sync` OK, `pages` = 0).
+    //
+    // Registering here rather than in the caller keeps the invariant local:
+    // the index job this function precedes REQUIRES the row to exist.
+    // `force: true` skips the git-repo check — a repo-managed workspace's
+    // root carries `loong`'s git dir while its subprojects live in their own
+    // checkouts, so isInsideGitRepo()/hasTrackedContent() describe only part
+    // of the tree.
+    await callGBrainOp("sources_add", { id: sourceId, name: sourceId, path: root, federated: false, force: true })
+    return
+  }
   if (existing.archived) throw new Error(`GBrain source ${sourceId} 已归档，请先恢复该 source`)
   if (existing.local_path !== root) await callGBrainOp("sources_set_path", { id: sourceId, path: root })
 }
@@ -65,7 +80,11 @@ async function executeManifestRun(job: SyncJob, input: ManifestRunInput, control
     if (controller.signal.aborted) throw new Error("Manifest 同步已取消")
     await bindGBrainSource(input.sourceId, root)
 
-    const indexed = await startCodeIndexJob({ root, sourceId: input.sourceId, workers: input.workers })
+    // forceImport: a repo/west workspace's root is itself a git checkout, so
+    // `startSyncJob`'s isGitRepository probe would pick `sync` and index only
+    // the manifest's `<project path=".">` (measured: 33 661 root files, 0 from
+    // every subproject). `import` walks the tree and sees all of them.
+    const indexed = await startCodeIndexJob({ root, sourceId: input.sourceId, workers: input.workers, forceImport: true })
     if (indexed.duplicate) throw new Error(`Source ${input.sourceId} 已有索引任务运行；Manifest workspace 已更新，请稍后重试索引`)
     const activeRun = manifestRuns().get(job.sourceId)
     if (activeRun) activeRun.childJobId = indexed.job.id

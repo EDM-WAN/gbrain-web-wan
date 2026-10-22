@@ -13,7 +13,7 @@
 //   node scripts/gbrain-sdk-sync.mjs finalize --url <gbrain-web-origin> --session <session-id>
 import { createHash } from 'node:crypto'
 import { createReadStream } from 'node:fs'
-import { open, readdir, realpath, stat } from 'node:fs/promises'
+import { open, readdir, readFile, realpath, stat } from 'node:fs/promises'
 import { extname, join, relative, resolve, sep } from 'node:path'
 
 // 与服务端 safeSdkRelativePath 的允许集保持一致：不匹配的文件在创建会话时
@@ -64,9 +64,28 @@ async function hashFile(filePath) {
   for await (const chunk of createReadStream(filePath)) hash.update(chunk)
   return hash.digest('hex')
 }
+
+/**
+ * True when a `.c` file is really a generated data blob (LVGL image/font
+ * arrays, XBM bitmaps, base64 payloads) rather than source.
+ *
+ * Size alone is not enough — a genuine 1.5 MiB source file should still be
+ * indexed. So the size pre-filter is combined with a content check: sample
+ * the first 256 KiB and count what fraction of the line starts look like
+ * data (`0x1f, 0x2e, ...`). Generated blobs sit above 90%; hand-written C
+ * sits near 0%.
+ */
+async function isGeneratedDataBlob(filePath) {
+  const dataLines = (await readFile(filePath, 'utf8')).slice(0, 256 * 1024).split('\n')
+  const lines = dataLines.filter((line) => line.trim().length > 0)
+  if (lines.length === 0) return false
+  const dataLike = lines.filter((line) => /^\s*(0x[0-9a-fA-F]{1,2}\s*,\s*){4,}/.test(line)).length
+  return dataLike / lines.length > 0.5
+}
 async function collect(root) {
   const files = []
   let skippedDirectories = 0
+  let skippedGeneratedAssets = 0
   async function walk(directory) {
     const entries = await readdir(directory, { withFileTypes: true })
     for (const entry of entries) {
@@ -89,6 +108,18 @@ async function collect(root) {
         console.error(`skip >2 GiB: ${rel}`)
         continue
       }
+      // Generated asset blobs. LVGL (and many other tools) emit images and
+      // fonts as `.c` files holding one giant uint8 array: demoui's
+      // resource/image/*.c are 89 files of 4.4 MB each whose only CODE is
+      // the 47-line wrapper around 775k hex bytes. They cost 400 MB of
+      // upload, produce hex-dump chunks the chunker cannot name, and every
+      // one of those chunks costs an embedding. Size is the cheap signal:
+      // real C source past 1 MiB is vanishingly rare, generated pixel data
+      // is never under it.
+      if (CODE.has(ext) && info.size > 1024 * 1024 && await isGeneratedDataBlob(fullPath)) {
+        skippedGeneratedAssets = (skippedGeneratedAssets ?? 0) + 1
+        continue
+      }
       const sha256 = await hashFile(fullPath)
       files.push({ path: rel, size: info.size, sha256, localPath: fullPath })
       if (files.length > 100_000) throw new Error('超过单次同步最多 100,000 个文件')
@@ -96,7 +127,7 @@ async function collect(root) {
   }
   await walk(root)
   files.sort((a, b) => a.path.localeCompare(b.path))
-  return { files, skippedDirectories }
+  return { files, skippedDirectories, skippedGeneratedAssets }
 }
 async function api(base, path, options = {}) {
   const token = requireToken()
@@ -204,9 +235,9 @@ async function syncCommand() {
   const origin = serviceOrigin(base)
   requireToken()
   const root = await realpath(resolve(input))
-  const { files, skippedDirectories } = await collect(root)
+  const { files, skippedDirectories, skippedGeneratedAssets } = await collect(root)
   if (files.length === 0) throw new Error('本机扫描未找到可上传的 SDK 代码/文档;未创建上传会话')
-  console.log(`Scanned ${files.length} indexable files locally; skipped ${skippedDirectories} metadata/dependency directories.`)
+  console.log(`Scanned ${files.length} indexable files locally; skipped ${skippedDirectories} metadata/dependency directories and ${skippedGeneratedAssets} generated data blobs.`)
   const session = await api(origin, '/api/code-source/upload/session', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ sourceId: source, files: files.map((file) => ({ path: file.path, size: file.size, sha256: file.sha256 })) }),
